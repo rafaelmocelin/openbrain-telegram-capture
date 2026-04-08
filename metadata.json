@@ -1,0 +1,20 @@
+{
+  "name": "Open Brain Telegram Capture",
+  "description": "Add Telegram as a model-backed assistant and quick-capture interface for Open Brain using Supabase memory, OpenRouter Gemini 3 Flash Preview, and MCP tools.",
+  "category": "integrations",
+  "author": {
+    "name": "Rafael Mocelin",
+    "github": "rafaelmocelin"
+  },
+  "version": "1.1.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Telegram", "Supabase"],
+    "tools": ["Supabase CLI"]
+  },
+  "tags": ["telegram", "capture", "integration", "mcp", "supabase", "open-brain"],
+  "difficulty": "beginner",
+  "estimated_time": "30-45 minutes",
+  "created": "2026-04-06",
+  "updated": "2026-04-06"
+}
