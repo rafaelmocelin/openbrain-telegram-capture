@@ -34,16 +34,13 @@ type TelegramUpdate = {
   channel_post?: TelegramMessage;
 };
 
-type AssistantIntent =
-  | { kind: "help" }
-  | { kind: "save"; content: string }
-  | { kind: "ideas" }
-  | { kind: "recent" }
-  | { kind: "tasks" }
-  | { kind: "stats" }
-  | { kind: "search"; query: string }
-  | { kind: "mark_done"; content_query: string }
-  | { kind: "assistant" };
+type OrchestrationPlan =
+  | { action: "help" }
+  | { action: "save"; content?: string; type_override?: string; items?: string[] }
+  | { action: "update"; content_query?: string; update_type?: "mark_done" | "change_type"; new_type?: string }
+  | { action: "query"; query_type: "ideas" | "recent" | "tasks" | "stats"; query?: string; status?: string; include_done?: boolean }
+  | { action: "search"; query: string; type?: string; status?: string; include_done?: boolean }
+  | { action: "assistant" };
 
 type OpenRouterToolCall = {
   id: string;
@@ -79,6 +76,10 @@ type ChatSummaryRow = {
   covers_through: string | null;
 };
 
+type BackgroundRuntime = {
+  waitUntil?: (promise: Promise<unknown>) => void;
+};
+
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
@@ -104,11 +105,12 @@ const MCP_TOOL_SCHEMAS = [
     type: "function",
     function: {
       name: "capture_thought",
-      description: "Save a thought into Open Brain.",
+      description: "Save a thought into Open Brain. Use type_override to preserve the user's explicit framing, such as task, idea, recipe, reference, prompt, or framework.",
       parameters: {
         type: "object",
         properties: {
           content: { type: "string", description: "The thought to capture." },
+          type_override: { type: "string", description: "Short type label to preserve the user's explicit framing. Prefer core labels like observation, task, idea, reference, person_note, but use a more specific label like recipe or prompt when the user clearly asks for that kind of thing." },
         },
         required: ["content"],
         additionalProperties: false,
@@ -126,6 +128,9 @@ const MCP_TOOL_SCHEMAS = [
           query: { type: "string", description: "Search query." },
           limit: { type: "integer", minimum: 1, maximum: 25, default: 10 },
           threshold: { type: "number", minimum: 0, maximum: 1, default: 0.5 },
+          type: { type: "string", description: "Optional type filter, such as task, idea, reference, or recipe." },
+          status: { type: "string", description: "Optional status filter, such as pending, in_progress, or done." },
+          include_done: { type: "boolean", description: "Include done tasks. Task searches exclude done items by default unless status is set to done." },
         },
         required: ["query"],
         additionalProperties: false,
@@ -142,6 +147,8 @@ const MCP_TOOL_SCHEMAS = [
         properties: {
           limit: { type: "integer", minimum: 1, maximum: 25, default: 10 },
           type: { type: "string" },
+          status: { type: "string", description: "Optional status filter, such as pending, in_progress, or done." },
+          include_done: { type: "boolean", description: "Include done tasks. Task lists exclude done items by default unless status is set to done." },
           topic: { type: "string" },
           person: { type: "string" },
           days: { type: "integer", minimum: 1, maximum: 365 },
@@ -166,7 +173,7 @@ const MCP_TOOL_SCHEMAS = [
     type: "function",
     function: {
       name: "update_thought",
-      description: "Update an existing thought's metadata or mark a task as done.",
+      description: "Update an existing thought's metadata, change type (e.g., 'reference' to 'idea'), or mark a task as done.",
       parameters: {
         type: "object",
         properties: {
@@ -174,6 +181,7 @@ const MCP_TOOL_SCHEMAS = [
           updates: {
             type: "object",
             properties: {
+              type: { type: "string", description: "New type label. Prefer observation, task, idea, reference, or person_note unless a more specific label like recipe or prompt is intentionally desired." },
               status: { type: "string", description: "New status: 'pending', 'in_progress', 'done'" },
             },
           },
@@ -186,24 +194,6 @@ const MCP_TOOL_SCHEMAS = [
 ] as const;
 
 const ASSISTANT_TOOL_SCHEMAS = MCP_TOOL_SCHEMAS.filter((tool) => tool.function.name !== "capture_thought");
-
-const EXPLICIT_SAVE_PATTERNS = [
-  /^(please\s+)?save\s+(this|that|it)\b/i,
-  /^(please\s+)?save\s+this\s+(idea|thought|note|task|observation)\b/i,
-  /^(please\s+)?remember\s+(this|that|it)\b/i,
-  /^(please\s+)?add\s+(this|that|it)\s+to\s+(my\s+)?open\s*brain\b/i,
-  /^(please\s+)?store\s+(this|that|it)\b/i,
-  /^(please\s+)?capture\s+(this|that|it)\b/i,
-  /\b(can|could|would)\s+you\s+(please\s+)?save\b/i,
-  /\b(can|could|would)\s+you\s+(please\s+)?remember\b/i,
-  /\badd\s+this\s+to\s+(my\s+)?open\s*brain\b/i,
-  /\b(add|capture|save)\s+these\s+(as\s+)?(two\s+)?separate\s+(work\s+)?tasks?\b/i,
-  /\bmake sure\s+(each|they|these)\s+(are\s+)?captured\s+separately\s+as\s+tasks?\b/i,
-  /\b(add|capture|save)\s+(these|those)\s+as\s+(two\s+)?separate\s+(work\s+)?tasks?\b/i,
-  /\bweren'?t\s+captured\b/i,
-  /tasks?\s+weren'?t\s+(saved|captured|sent|stored)\b/i,
-  /work\s*tasks?\s*:\s*\d+/i,
-];
 
 function getMessageFromUpdate(update: TelegramUpdate): TelegramMessage | null {
   return update.message ?? update.channel_post ?? null;
@@ -252,10 +242,6 @@ function buildThoughtContent(message: TelegramMessage, rawText: string): string 
   if (sender) context.splice(2, 0, `From: ${sender}`);
 
   return `${rawText}\n\n[${context.join(" | ")}]`;
-}
-
-function looksLikeExplicitSaveRequest(text: string): boolean {
-  return EXPLICIT_SAVE_PATTERNS.some((pattern) => pattern.test(text.trim()));
 }
 
 async function recordChatMessage(
@@ -436,37 +422,97 @@ function buildHelpText(): string {
   ].join("\n");
 }
 
-function detectIntent(rawText: string): AssistantIntent {
-  const text = rawText.trim();
-  const lower = text.toLowerCase();
+async function orchestrate(
+  text: string,
+  message: TelegramMessage,
+  memory: ChatMemory,
+): Promise<OrchestrationPlan> {
+  const messages: OpenRouterMessage[] = [
+    {
+      role: "system",
+      content: [
+        "You orchestrate an Open Brain Telegram bot.",
+        "Return a single JSON object that decides how the bot should handle the user's message.",
+        "",
+        "Allowed actions:",
+        '- "help"',
+        '- "save"',
+        '- "update"',
+        '- "query"',
+        '- "search"',
+        '- "assistant"',
+        "",
+        "JSON fields:",
+        '- "action": required',
+        '- "content": cleaned standalone thought content for save',
+        '- "type_override": short type label that preserves the user\'s explicit framing when relevant',
+        '- "items": array of cleaned save items only when user explicitly wants multiple separate items saved',
+        '- "content_query": phrase to identify an existing thought for updates',
+        '- "update_type": "mark_done" or "change_type"',
+        '- "new_type": only for change_type updates',
+        '- "query_type": "ideas", "recent", "tasks", or "stats" for list/stat requests',
+        '- "status": optional status filter for query or search requests, such as pending, in_progress, or done',
+        '- "include_done": optional boolean for query or search requests when the user explicitly wants done tasks included',
+        '- "query": search text for search requests',
+        "",
+        "Rules:",
+        "- Use save when the user is explicitly asking to capture/store/add/save something to Open Brain.",
+        "- Use update when the user is explicitly changing status/type of an existing saved thought.",
+        "- Use query for list-like requests such as ideas, recent items, tasks, or stats.",
+        "- Use search for semantic retrieval questions about saved thoughts.",
+        "- Use assistant for general conversation or analysis that is not an explicit save/update/list/search command.",
+        "- Active tasks are the default. If the user asks for tasks without mentioning completed/done, prefer pending or in-progress tasks and leave done tasks out.",
+        "- If the user explicitly asks for completed/done tasks, set status=done.",
+        "- Prefer core type labels observation, task, idea, reference, and person_note by default.",
+        "- If the user explicitly names the kind of thing being saved, preserve that framing in type_override, even when it is more specific than the core labels, such as recipe, prompt, framework, workout, or checklist.",
+        "- Examples: 'save this recipe' -> action=save, type_override=recipe. 'save this prompt for later' -> action=save, type_override=prompt. 'save this as an idea' -> action=save, type_override=idea.",
+        "- If multiple items are being saved separately, fill items and do not also include content.",
+        "- Return valid JSON only. No markdown. No prose.",
+      ].join("\n"),
+    },
+    {
+      role: "system",
+      content: `Chat context:\nFrom: ${describeSender(message) || "unknown"}\nChat type: ${message.chat.type}`,
+    },
+  ];
 
-  if (!text) return { kind: "help" };
-  if (lower === "/help" || lower === "help") return { kind: "help" };
-
-  if (lower.startsWith("/save ")) {
-    const content = text.slice(6).trim();
-    return content ? { kind: "save", content } : { kind: "help" };
+  if (memory.summary.trim()) {
+    messages.push({ role: "system", content: `Memory summary:\n${memory.summary.trim()}` });
   }
 
-  if (lower === "/ideas") return { kind: "ideas" };
-  if (lower === "/recent") return { kind: "recent" };
-  if (lower === "/tasks") return { kind: "tasks" };
-  if (lower === "/stats") return { kind: "stats" };
-  if (lower.startsWith("/search ")) {
-    const query = text.slice(8).trim();
-    return query ? { kind: "search", query } : { kind: "help" };
+  if (memory.recent.length > 0) {
+    const recentText = memory.recent
+      .map((entry) => `${entry.role.toUpperCase()}: ${entry.content}`)
+      .join("\n");
+    messages.push({ role: "system", content: `Recent context:\n${recentText}` });
   }
 
-  if (/\b(mark|complete|finish)\b.*\b(done|complete|finished)\b/i.test(text)) {
-    const content_query = text
-      .replace(/\b(mark|please\s+mark|please|complete|finish|that|this|the|task|as|done|completed|finished)\b/gi, "")
-      .trim()
-      .replace(/\s+/g, " ")
-      .replace(/^[.,;:\-]+|[.,;:\-]+$/g, "");
-    return { kind: "mark_done", content_query: content_query || text };
+  messages.push({ role: "user", content: text });
+
+  try {
+    const result = await callOpenRouterChat(messages, false, [], 12000);
+    const plan = JSON.parse(result.content);
+    if (plan.action && typeof plan.action === "string") {
+      return plan as OrchestrationPlan;
+    }
+  } catch (error) {
+    console.error("Orchestrator error:", error);
   }
 
-  return { kind: "assistant" };
+  if (!text.trim()) return { action: "help" };
+  return { action: "assistant" };
+}
+
+function runInBackground(task: Promise<void>): void {
+  const runtime = (globalThis as typeof globalThis & { EdgeRuntime?: BackgroundRuntime }).EdgeRuntime;
+  if (runtime?.waitUntil) {
+    runtime.waitUntil(task);
+    return;
+  }
+
+  task.catch((error) => {
+    console.error("Background task failed:", error);
+  });
 }
 
 function parseJsonArguments(raw: string): Record<string, unknown> {
@@ -524,51 +570,65 @@ async function sendTelegramReply(message: TelegramMessage, text: string): Promis
   }
 }
 
-async function callOpenBrainTool(name: string, args: Record<string, unknown>): Promise<string> {
-  const response = await fetch(`${OPENBRAIN_MCP_URL}?key=${encodeURIComponent(OPENBRAIN_MCP_KEY)}`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json, text/event-stream",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: { name, arguments: args },
-    }),
-  });
+async function callOpenBrainTool(name: string, args: Record<string, unknown>, timeoutMs = 10000): Promise<string> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch(`${OPENBRAIN_MCP_URL}?key=${encodeURIComponent(OPENBRAIN_MCP_KEY)}`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Open Brain MCP request failed (${response.status}): ${body}`);
-  }
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Open Brain MCP request failed (${response.status}): ${body}`);
+    }
 
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    const json = await response.json();
-    const text = json?.result?.content?.[0]?.text;
-    if (typeof text === "string" && text.length > 0) return text;
-    throw new Error(`Unexpected MCP JSON response: ${JSON.stringify(json)}`);
-  }
-
-  const raw = await response.text();
-  for (const line of raw.split("\n")) {
-    if (!line.startsWith("data: ")) continue;
-    try {
-      const json = JSON.parse(line.slice(6));
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const json = await response.json();
       const text = json?.result?.content?.[0]?.text;
       if (typeof text === "string" && text.length > 0) return text;
-    } catch {
-      // keep scanning
+      throw new Error(`Unexpected MCP JSON response: ${JSON.stringify(json)}`);
     }
-  }
 
-  throw new Error(`Unexpected MCP SSE response: ${raw}`);
+    const raw = await response.text();
+    for (const line of raw.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const json = JSON.parse(line.slice(6));
+        const text = json?.result?.content?.[0]?.text;
+        if (typeof text === "string" && text.length > 0) return text;
+      } catch {
+        // keep scanning
+      }
+    }
+
+    throw new Error(`Unexpected MCP SSE response: ${raw}`);
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`MCP request to ${name} timed out`);
+    }
+    throw error;
+  }
 }
 
-function buildAssistantSystemPrompt(allowNaturalLanguageSave: boolean): string {
-  const rules = [
+function buildAssistantSystemPrompt(): string {
+  return [
     "You are the Open Brain Telegram assistant.",
     "Answer naturally and synthesize results instead of dumping raw tool output.",
     "Rules:",
@@ -578,61 +638,65 @@ function buildAssistantSystemPrompt(allowNaturalLanguageSave: boolean): string {
     "- Keep replies concise and useful.",
     "- If the user asks for many results, chunk them or summarize them.",
     "- When the user asks to list, search, or query stored data in Open Brain, always use the available tools. Never answer from memory or conversation history.",
-    "- Use list_thoughts for listing items (with appropriate filters like type, topic, days). Use search_thoughts for keyword searches. Use thought_stats for statistics.",
-    "- Interpret the user's intent naturally - if they ask for 'tasks', filter by type=\"task\"; if they ask for 'recent items', use days filter; if they want everything, omit the filter.",
+    "- Use list_thoughts for listing items (with appropriate filters like type, status, topic, days). Use search_thoughts for keyword searches. Use thought_stats for statistics.",
+    "- Interpret the user's intent naturally - if they ask for 'tasks', filter by type=\"task\" and default to active tasks. If they ask for completed or done tasks, include status=\"done\".",
     "- When the user asks to mark something as done, complete, or finished, use the update_thought tool with status=\"done\".",
-  ];
-
-  if (allowNaturalLanguageSave) {
-    rules.push(
-      "- The user appears to be explicitly asking to save something.",
-      "- You may use capture_thought if that is the best match for the request.",
-      "- When using capture_thought, pass only the cleaned thought content to save. Telegram source metadata is added automatically.",
-      "- Save each task/item as a separate thought when the user requests multiple items.",
-    );
-  } else {
-    rules.push("- Do not save anything unless the user used /save in this turn.");
-    rules.push("- Never claim something was saved if you did not call capture_thought.");
-  }
-
-  return rules.join("\n");
+    "- When the user says something should be a different type (e.g., 'not a reference, save it as an idea'), use update_thought with the correct type.",
+    "- When saving, preserve the user's explicit framing. If they call it a recipe, prompt, framework, or checklist, pass that as type_override instead of collapsing it into a generic bucket.",
+    "- Do not save anything unless the user explicitly asks. Never claim something was saved if you did not call capture_thought.",
+  ].join("\n");
 }
 
 async function callOpenRouterChat(
   messages: OpenRouterMessage[],
   allowTools = true,
   tools = MCP_TOOL_SCHEMAS,
+  timeoutMs = 10000,
 ): Promise<{ content: string; toolCalls: OpenRouterToolCall[] }> {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://github.com/rafaelmocelin/openbrain-telegram-capture",
-      "X-Title": "Open Brain Telegram Assistant",
-    },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL,
-      messages,
-      ...(allowTools ? { tools, tool_choice: "auto" } : {}),
-      temperature: 0.3,
-      max_tokens: 900,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/rafaelmocelin/openbrain-telegram-capture",
+        "X-Title": "Open Brain Telegram Assistant",
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_MODEL,
+        messages,
+        ...(allowTools ? { tools, tool_choice: "auto" } : {}),
+        temperature: 0.3,
+        max_tokens: allowTools ? 900 : 300,
+      }),
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`OpenRouter request failed (${response.status}): ${body}`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`OpenRouter request failed (${response.status}): ${body}`);
+    }
+
+    const json = await response.json();
+    const choice = json?.choices?.[0]?.message;
+    if (!choice) throw new Error(`Unexpected OpenRouter response: ${JSON.stringify(json)}`);
+
+    return {
+      content: typeof choice.content === "string" ? choice.content : "",
+      toolCalls: Array.isArray(choice.tool_calls) ? choice.tool_calls as OpenRouterToolCall[] : [],
+    };
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+    throw error;
   }
-
-  const json = await response.json();
-  const choice = json?.choices?.[0]?.message;
-  if (!choice) throw new Error(`Unexpected OpenRouter response: ${JSON.stringify(json)}`);
-
-  return {
-    content: typeof choice.content === "string" ? choice.content : "",
-    toolCalls: Array.isArray(choice.tool_calls) ? choice.tool_calls as OpenRouterToolCall[] : [],
-  };
 }
 
 async function callAssistant(
@@ -674,15 +738,7 @@ async function callAssistant(
   return "I hit the tool-call limit while answering that.";
 }
 
-function looksLikeRawToolDump(text: string): boolean {
-  return /^(Total thoughts:|No thoughts found matching|\d+ recent thought\(s\):|event: message|data: )/i.test(
-    text.trim(),
-  );
-}
-
 async function polishAssistantReply(userText: string, draft: string): Promise<string> {
-  if (!looksLikeRawToolDump(draft)) return draft;
-
   const messages: OpenRouterMessage[] = [
     {
       role: "system",
@@ -711,9 +767,7 @@ async function callMcpDirect(name: string, args: Record<string, unknown>): Promi
 }
 
 async function handleAssistant(message: TelegramMessage, text: string): Promise<string> {
-  const allowNaturalLanguageSave = looksLikeExplicitSaveRequest(text);
-  const system = buildAssistantSystemPrompt(allowNaturalLanguageSave);
-  await compactChatMemory(message.chat.id);
+  const system = buildAssistantSystemPrompt();
   const memory = await loadChatMemory(message.chat.id);
 
   const messages: OpenRouterMessage[] = [{ role: "system", content: system }];
@@ -729,109 +783,28 @@ async function handleAssistant(message: TelegramMessage, text: string): Promise<
     messages.push({ role: "system", content: `Recent Telegram context:\n${recentText}` });
   }
 
-  await recordChatMessage(message.chat.id, "user", text);
   messages.push({ role: "user", content: text });
-  return await callAssistant(
-    messages,
-    message,
-    allowNaturalLanguageSave ? MCP_TOOL_SCHEMAS : ASSISTANT_TOOL_SCHEMAS,
-  );
+  return await callAssistant(messages, message, ASSISTANT_TOOL_SCHEMAS);
 }
 
-async function rewriteThoughtForNaturalLanguageSave(
-  text: string,
-  memory: ChatMemory,
-): Promise<string> {
-  const messages: OpenRouterMessage[] = [
-    {
-      role: "system",
-      content: [
-        "The user is explicitly asking to save something to Open Brain.",
-        "Rewrite the content into the cleaned thought that should be stored.",
-        "Remove request phrasing like 'save this' or 'remember this'.",
-        "Preserve the actual idea, task, note, or observation.",
-        "If the user refers to earlier context, use the provided memory to resolve it when possible.",
-        "Return only the final thought text to save. Do not add preamble, bullets, or quotes unless they are part of the thought.",
-      ].join("\n"),
-    },
-  ];
-
-  if (memory.summary.trim()) {
-    messages.push({ role: "system", content: `Temporary Telegram memory summary:\n${memory.summary.trim()}` });
-  }
-
-  if (memory.recent.length > 0) {
-    const recentText = memory.recent
-      .map((entry) => `${entry.role.toUpperCase()}: ${entry.content}`)
-      .join("\n");
-    messages.push({ role: "system", content: `Recent Telegram context:\n${recentText}` });
-  }
-
-  messages.push({ role: "user", content: text });
-
-  const result = await callOpenRouterChat(messages, false);
-  const rewritten = result.content.trim();
-  return rewritten || text;
-}
-
-async function handleNaturalLanguageSave(message: TelegramMessage, text: string): Promise<string> {
-  await compactChatMemory(message.chat.id);
-  const memory = await loadChatMemory(message.chat.id);
-  await recordChatMessage(message.chat.id, "user", text);
-
-  const numberedPattern = /^\d+\.\s*.+$/gm;
-  const matches = text.match(numberedPattern);
-
-  if (matches && matches.length > 1) {
-    const results: string[] = [];
-    for (const item of matches) {
-      const cleanedItem = await rewriteThoughtForNaturalLanguageSave(item, memory);
-      const result = await callMcpDirect("capture_thought", {
-        content: buildThoughtContent(message, cleanedItem),
-      });
-      results.push(result);
-    }
-    const reply = `Captured ${results.length} items to Open Brain:\n${results.join("\n")}`;
-    await recordChatMessage(message.chat.id, "assistant", reply);
-    return reply;
-  }
-
-  const cleanedThought = await rewriteThoughtForNaturalLanguageSave(text, memory);
-  const captureResult = await callMcpDirect("capture_thought", {
-    content: buildThoughtContent(message, cleanedThought),
-  });
-
-  const reply = `Captured to Open Brain\n${captureResult}`;
-  await recordChatMessage(message.chat.id, "assistant", reply);
-  return reply;
-}
-
-Deno.serve(async (request: Request): Promise<Response> => {
+async function processTelegramUpdate(update: TelegramUpdate): Promise<void> {
   let claimedUpdateId: number | null = null;
-
-  if (request.method !== "POST") {
-    return new Response("Method not allowed", { status: 405 });
-  }
-
-  if (!hasValidWebhookSecret(request)) {
-    return new Response("Unauthorized", { status: 401 });
-  }
+  let message: TelegramMessage | null = null;
 
   try {
-    const update = await request.json() as TelegramUpdate;
-    const message = getMessageFromUpdate(update);
-    if (!message) return new Response("ok", { status: 200 });
+    message = getMessageFromUpdate(update);
+    if (!message) return;
 
     const chatId = String(message.chat.id);
     if (!allowedChatIds.has(chatId)) {
       console.warn("Ignoring message from unauthorized chat", chatId);
-      return new Response("ok", { status: 200 });
+      return;
     }
 
     const text = getMessageText(message);
     if (!text) {
       await sendTelegramReply(message, "Text messages and captions are supported.");
-      return new Response("ok", { status: 200 });
+      return;
     }
 
     const { error: claimError } = await supabase.from("telegram_capture_events").insert({
@@ -841,34 +814,71 @@ Deno.serve(async (request: Request): Promise<Response> => {
     });
 
     if (claimError) {
-      if (claimError.code === "23505") return new Response("ok", { status: 200 });
+      if (claimError.code === "23505") return;
       throw claimError;
     }
 
     claimedUpdateId = update.update_id;
+    console.log("Processing message:", text.substring(0, 100));
 
-    const intent = detectIntent(text);
+    await compactChatMemory(message.chat.id);
+    const memory = await loadChatMemory(message.chat.id);
+    await recordChatMessage(message.chat.id, "user", text);
+
+    const plan = await orchestrate(text, message, memory);
+    console.log("Orchestrator plan:", JSON.stringify(plan));
+
     let replyText = "";
 
-    if (intent.kind === "help") {
+    if (plan.action === "help") {
       replyText = buildHelpText();
-    } else if (intent.kind === "save") {
-      const captureResult = await callMcpDirect("capture_thought", { content: buildThoughtContent(message, intent.content) });
-      replyText = `Captured to Open Brain\n${captureResult}`;
-    } else if (intent.kind === "ideas") {
-      replyText = await callMcpDirect("list_thoughts", { limit: 25, type: "idea" });
-    } else if (intent.kind === "recent") {
-      replyText = await callMcpDirect("list_thoughts", { limit: 25 });
-    } else if (intent.kind === "tasks") {
-      replyText = await callMcpDirect("list_thoughts", { limit: 25, type: "task" });
-    } else if (intent.kind === "stats") {
-      replyText = await callMcpDirect("thought_stats", {});
-    } else if (intent.kind === "search") {
-      replyText = await callMcpDirect("search_thoughts", { query: intent.query, limit: 25 });
-    } else if (intent.kind === "mark_done") {
-      replyText = await callMcpDirect("update_thought", {
-        content_query: intent.content_query,
-        updates: { status: "done" },
+    } else if (plan.action === "save") {
+      if (plan.items && plan.items.length > 0) {
+        const results: string[] = [];
+        for (const item of plan.items) {
+          const captureArgs: Record<string, unknown> = { content: buildThoughtContent(message, item) };
+          if (plan.type_override) captureArgs.type_override = plan.type_override;
+          results.push(await callMcpDirect("capture_thought", captureArgs));
+        }
+        replyText = `Captured ${results.length} items to Open Brain:\n${results.join("\n")}`;
+      } else if (plan.content) {
+        const captureArgs: Record<string, unknown> = { content: buildThoughtContent(message, plan.content) };
+        if (plan.type_override) captureArgs.type_override = plan.type_override;
+        replyText = `Captured to Open Brain\n${await callMcpDirect("capture_thought", captureArgs)}`;
+      } else {
+        replyText = await polishAssistantReply(text, await handleAssistant(message, text));
+      }
+    } else if (plan.action === "update") {
+      if (plan.update_type === "mark_done") {
+        replyText = await callMcpDirect("update_thought", {
+          content_query: plan.content_query || text,
+          updates: { status: "done" },
+        });
+      } else if (plan.update_type === "change_type" && plan.new_type) {
+        replyText = await callMcpDirect("update_thought", {
+          content_query: plan.content_query || text,
+          updates: { type: plan.new_type },
+        });
+      } else {
+        replyText = await polishAssistantReply(text, await handleAssistant(message, text));
+      }
+    } else if (plan.action === "query") {
+      if (plan.query_type === "ideas") {
+        replyText = await callMcpDirect("list_thoughts", { limit: 25, type: "idea", status: plan.status, include_done: plan.include_done });
+      } else if (plan.query_type === "recent") {
+        replyText = await callMcpDirect("list_thoughts", { limit: 25, status: plan.status, include_done: plan.include_done });
+      } else if (plan.query_type === "tasks") {
+        replyText = await callMcpDirect("list_thoughts", { limit: 25, type: "task", status: plan.status, include_done: plan.include_done });
+      } else {
+        replyText = await callMcpDirect("thought_stats", {});
+      }
+    } else if (plan.action === "search") {
+      replyText = await callMcpDirect("search_thoughts", {
+        query: plan.query,
+        limit: 25,
+        type: plan.type,
+        status: plan.status,
+        include_done: plan.include_done,
       });
     } else {
       if (!isPrivateChat(message)) {
@@ -876,18 +886,16 @@ Deno.serve(async (request: Request): Promise<Response> => {
           "AI chat is only enabled in private chat.",
           "Use a slash command here, or send me a direct message for assistant replies.",
         ].join("\n");
-      } else if (looksLikeExplicitSaveRequest(text)) {
-        replyText = await handleNaturalLanguageSave(message, text);
       } else {
-        replyText = await handleAssistant(message, text);
-        replyText = await polishAssistantReply(text, replyText);
-        await recordChatMessage(message.chat.id, "assistant", replyText);
+        replyText = await polishAssistantReply(text, await handleAssistant(message, text));
       }
     }
 
+    await recordChatMessage(message.chat.id, "assistant", replyText);
     await sendTelegramReply(message, replyText);
-    return new Response("ok", { status: 200 });
   } catch (error) {
+    console.error("telegram-capture error:", error);
+
     if (claimedUpdateId !== null) {
       const { error: releaseError } = await supabase
         .from("telegram_capture_events")
@@ -899,7 +907,34 @@ Deno.serve(async (request: Request): Promise<Response> => {
       }
     }
 
-    console.error("telegram-capture error:", error);
-    return new Response("error", { status: 500 });
+    if (message) {
+      const errorMsg = `Sorry, something went wrong: ${error instanceof Error ? error.message : String(error)}`;
+      await sendTelegramReply(message, errorMsg);
+    }
+  }
+}
+
+Deno.serve(async (request: Request): Promise<Response> => {
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  if (!hasValidWebhookSecret(request)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  try {
+    const update = await request.json() as TelegramUpdate;
+    const task = processTelegramUpdate(update);
+    const runtime = (globalThis as typeof globalThis & { EdgeRuntime?: BackgroundRuntime }).EdgeRuntime;
+    if (runtime?.waitUntil) {
+      runInBackground(task);
+    } else {
+      await task;
+    }
+    return new Response("ok", { status: 200 });
+  } catch (error) {
+    console.error("telegram-capture request error:", error);
+    return new Response("ok", { status: 200 });
   }
 });

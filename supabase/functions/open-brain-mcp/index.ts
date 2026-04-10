@@ -52,7 +52,9 @@ async function extractMetadata(text: string): Promise<Record<string, unknown>> {
 - "action_items": array of implied to-dos (empty if none)
 - "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
 - "topics": array of 1-3 short topic tags (always at least one)
-- "type": one of "observation", "task", "idea", "reference", "person_note"
+- "type": a short lowercase type label
+Prefer the core labels "observation", "task", "idea", "reference", and "person_note" by default.
+If the content clearly belongs to a more specific user-meaningful kind such as "recipe", "prompt", "framework", or "checklist", use that more specific label instead.
 Only extract what's explicitly there.`,
         },
         { role: "user", content: text },
@@ -65,6 +67,73 @@ Only extract what's explicitly there.`,
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
+}
+
+function getTypeLabel(metadata: Record<string, unknown>): string | null {
+  return typeof metadata.type === "string" && metadata.type.trim()
+    ? metadata.type.trim()
+    : null;
+}
+
+function getStatusLabel(metadata: Record<string, unknown>): string | null {
+  return typeof metadata.status === "string" && metadata.status.trim()
+    ? metadata.status.trim()
+    : null;
+}
+
+function shouldIncludeByStatus(
+  metadata: Record<string, unknown>,
+  options: { type?: string; status?: string; include_done?: boolean },
+): boolean {
+  const status = getStatusLabel(metadata);
+
+  if (options.status) return status === options.status;
+  if (options.include_done) return true;
+  if (options.type === "task") return status !== "done";
+  return true;
+}
+
+function applyTaskDefaults(metadata: Record<string, unknown>): Record<string, unknown> {
+  const type = getTypeLabel(metadata);
+  if (type === "task" && !getStatusLabel(metadata)) {
+    return { ...metadata, status: "pending" };
+  }
+  return metadata;
+}
+
+function buildUpdatedMetadata(
+  currentMetadata: Record<string, unknown>,
+  updates: Record<string, unknown>,
+): Record<string, unknown> {
+  const newMetadata = { ...currentMetadata, ...updates };
+  const status = getStatusLabel(newMetadata);
+  const type = getTypeLabel(newMetadata);
+
+  if (type === "task" && !status) {
+    newMetadata.status = "pending";
+  }
+
+  if (status === "done") {
+    newMetadata.completed_at = typeof currentMetadata.completed_at === "string"
+      ? currentMetadata.completed_at
+      : new Date().toISOString();
+  } else if ("completed_at" in newMetadata) {
+    delete newMetadata.completed_at;
+  }
+
+  return newMetadata;
+}
+
+function describeStatus(metadata: Record<string, unknown>): string | null {
+  const status = getStatusLabel(metadata);
+  if (!status) return null;
+
+  if (status !== "done") return status;
+
+  const completedAt = typeof metadata.completed_at === "string" ? metadata.completed_at : null;
+  if (!completedAt) return status;
+
+  return `${status} on ${new Date(completedAt).toLocaleDateString()}`;
 }
 
 // --- MCP Server Setup ---
@@ -85,15 +154,18 @@ server.registerTool(
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
       threshold: z.number().optional().default(0.5),
+      type: z.string().optional().describe("Optional type filter, such as task, idea, recipe, or reference"),
+      status: z.string().optional().describe("Optional status filter, such as pending, in_progress, or done"),
+      include_done: z.boolean().optional().default(false).describe("Include done tasks. By default, task searches exclude done tasks unless status='done'."),
     },
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold, type, status, include_done }) => {
     try {
       const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
         query_embedding: qEmb,
         match_threshold: threshold,
-        match_count: limit,
+        match_count: Math.min(Math.max(limit * 5, limit), 100),
         filter: {},
       });
 
@@ -104,13 +176,21 @@ server.registerTool(
         };
       }
 
-      if (!data || data.length === 0) {
+      const filtered = (data || [])
+        .filter((t: { metadata: Record<string, unknown> }) => {
+          const metadata = (t.metadata || {}) as Record<string, unknown>;
+          if (type && getTypeLabel(metadata) !== type) return false;
+          return shouldIncludeByStatus(metadata, { type, status, include_done });
+        })
+        .slice(0, limit);
+
+      if (filtered.length === 0) {
         return {
           content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
         };
       }
 
-      const results = data.map(
+      const results = filtered.map(
         (
           t: {
             content: string;
@@ -126,6 +206,8 @@ server.registerTool(
             `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
             `Type: ${m.type || "unknown"}`,
           ];
+          const statusText = describeStatus(m);
+          if (statusText) parts.push(`Status: ${statusText}`);
           if (Array.isArray(m.topics) && m.topics.length)
             parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
           if (Array.isArray(m.people) && m.people.length)
@@ -141,7 +223,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+            text: `Found ${filtered.length} thought(s):\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -163,19 +245,22 @@ server.registerTool(
       "List recently captured thoughts with optional filters by type, topic, person, or time range.",
     inputSchema: {
       limit: z.number().optional().default(10),
-      type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
+      type: z.string().optional().describe("Filter by type label, such as observation, task, idea, reference, person_note, recipe, prompt, or framework"),
+      status: z.string().optional().describe("Optional status filter, such as pending, in_progress, or done"),
+      include_done: z.boolean().optional().default(false).describe("Include done tasks. By default, task lists exclude done tasks unless status='done'."),
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
       days: z.number().optional().describe("Only thoughts from the last N days"),
     },
   },
-  async ({ limit, type, topic, person, days }) => {
+  async ({ limit, type, status, include_done, topic, person, days }) => {
     try {
+      const fetchLimit = type === "task" && !status && !include_done ? Math.min(Math.max(limit * 5, limit), 100) : limit;
       let q = supabase
         .from("thoughts")
         .select("content, metadata, created_at")
         .order("created_at", { ascending: false })
-        .limit(limit);
+        .limit(fetchLimit);
 
       if (type) q = q.contains("metadata", { type });
       if (topic) q = q.contains("metadata", { topics: [topic] });
@@ -195,18 +280,27 @@ server.registerTool(
         };
       }
 
-      if (!data || !data.length) {
+      const filtered = (data || [])
+        .filter((t: { metadata: Record<string, unknown> }) => {
+          const metadata = (t.metadata || {}) as Record<string, unknown>;
+          return shouldIncludeByStatus(metadata, { type, status, include_done });
+        })
+        .slice(0, limit);
+
+      if (!filtered.length) {
         return { content: [{ type: "text" as const, text: "No thoughts found." }] };
       }
 
-      const results = data.map(
+      const results = filtered.map(
         (
           t: { content: string; metadata: Record<string, unknown>; created_at: string },
           i: number
         ) => {
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+          const statusText = describeStatus(m);
+          const statusSuffix = statusText ? ` | ${statusText}` : "";
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""}${statusSuffix})\n   ${t.content}`;
         }
       );
 
@@ -214,7 +308,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
+            text: `${filtered.length} recent thought(s):\n\n${results.join("\n\n")}`,
           },
         ],
       };
@@ -307,18 +401,23 @@ server.registerTool(
       "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
     inputSchema: {
       content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      type_override: z.string().optional().describe("Force a specific short type label. Prefer core labels like observation, task, idea, reference, and person_note, but preserve a more specific user framing like recipe, prompt, framework, or checklist when explicitly relevant."),
     },
   },
-  async ({ content }) => {
+  async ({ content, type_override }) => {
     try {
       const [embedding, metadata] = await Promise.all([
         getEmbedding(content),
         extractMetadata(content),
       ]);
 
+      const finalMetadata = applyTaskDefaults(type_override
+        ? { ...metadata, type: type_override, source: "mcp" }
+        : { ...metadata, source: "mcp" });
+
       const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
         p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
+        p_payload: { metadata: finalMetadata },
       });
 
       if (upsertError) {
@@ -341,8 +440,10 @@ server.registerTool(
         };
       }
 
-      const meta = metadata as Record<string, unknown>;
+      const meta = finalMetadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
+      const statusText = describeStatus(meta);
+      if (statusText) confirmation += ` (${statusText})`;
       if (Array.isArray(meta.topics) && meta.topics.length)
         confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
       if (Array.isArray(meta.people) && meta.people.length)
@@ -368,59 +469,110 @@ server.registerTool(
   {
     title: "Update Thought",
     description:
-      "Update an existing thought's metadata. Use this to mark tasks as done, change status, or update any metadata field.",
+      "Update an existing thought's metadata. Use semantic search to find the thought, then update it. Use this to change type (e.g., 'reference' to 'idea'), mark tasks as done, change status, or update any metadata field.",
     inputSchema: {
-      content_query: z.string().describe("Text from the thought to identify it"),
+      content_query: z.string().describe("Text from the thought to identify it - use the same words the user used to describe it"),
       updates: z.object({
+        type: z.string().optional().describe("New type label. Prefer observation, task, idea, reference, or person_note unless a more specific label like recipe, prompt, or framework is intentionally desired."),
         status: z.string().optional().describe("New status: 'pending', 'in_progress', 'done'"),
       }).optional().describe("Fields to update in the thought's metadata"),
     },
   },
   async ({ content_query, updates }) => {
     try {
-      const normalized = content_query.toLowerCase().trim().replace(/\s+/g, " ");
-      const hashBuffer = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalized));
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const fingerprint = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+      const queryEmb = await getEmbedding(content_query);
+      
+      const { data: matches, error: searchError } = await supabase.rpc("match_thoughts", {
+        query_embedding: queryEmb,
+        match_threshold: 0.6,
+        match_count: 3,
+        filter: {},
+      });
 
-      const { data, error } = await supabase
-        .from("thoughts")
-        .select("id, content, metadata")
-        .eq("content_fingerprint", fingerprint)
-        .limit(1);
-
-      if (error) {
+      if (searchError) {
         return {
-          content: [{ type: "text" as const, text: `Error finding thought: ${error.message}` }],
+          content: [{ type: "text" as const, text: `Search error: ${searchError.message}` }],
           isError: true,
         };
       }
 
-      if (!data || data.length === 0) {
+      if (!matches || matches.length === 0) {
         return {
-          content: [{ type: "text" as const, text: `No thought found matching "${content_query}". Try a more specific phrase.` }],
+          content: [{ type: "text" as const, text: `No thought found matching "${content_query}". Try a different phrase.` }],
           isError: true,
         };
       }
 
-      const thought = data[0];
-      const newMetadata = { ...(thought.metadata || {}), ...updates };
+      const topMatch = matches[0];
 
-      const { error: updateError } = await supabase
-        .from("thoughts")
-        .update({ metadata: newMetadata, updated_at: new Date().toISOString() })
-        .eq("id", thought.id);
+      if (topMatch.similarity > 0.85) {
+        const thought = topMatch;
+        const newMetadata = buildUpdatedMetadata(
+          (thought.metadata || {}) as Record<string, unknown>,
+          (updates || {}) as Record<string, unknown>,
+        );
 
-      if (updateError) {
+        const typeMsg = updates?.type ? `Type changed to "${updates.type}"` : "";
+        const statusMsg = updates?.status ? `Status set to "${updates.status}"` : "";
+        const completedMsg = updates?.status === "done" ? `Completed at "${newMetadata.completed_at}"` : "";
+        const updateMsgs = [typeMsg, statusMsg, completedMsg].filter(Boolean).join(", ") || "Metadata updated";
+
+        const { error: updateError } = await supabase
+          .from("thoughts")
+          .update({ metadata: newMetadata, updated_at: new Date().toISOString() })
+          .eq("id", thought.id);
+
+        if (updateError) {
+          return {
+            content: [{ type: "text" as const, text: `Error updating thought: ${updateError.message}` }],
+            isError: true,
+          };
+        }
+
         return {
-          content: [{ type: "text" as const, text: `Error updating thought: ${updateError.message}` }],
-          isError: true,
+          content: [{ type: "text" as const, text: `Updated thought: ${updateMsgs}` }],
         };
       }
 
-      const statusMsg = updates?.status ? `Status set to "${updates.status}"` : "Metadata updated";
+      if (matches.length === 1 && topMatch.similarity >= 0.7) {
+        const thought = topMatch;
+        const newMetadata = buildUpdatedMetadata(
+          (thought.metadata || {}) as Record<string, unknown>,
+          (updates || {}) as Record<string, unknown>,
+        );
+
+        const typeMsg = updates?.type ? `Type changed to "${updates.type}"` : "";
+        const statusMsg = updates?.status ? `Status set to "${updates.status}"` : "";
+        const completedMsg = updates?.status === "done" ? `Completed at "${newMetadata.completed_at}"` : "";
+        const updateMsgs = [typeMsg, statusMsg, completedMsg].filter(Boolean).join(", ") || "Metadata updated";
+
+        const { error: updateError } = await supabase
+          .from("thoughts")
+          .update({ metadata: newMetadata, updated_at: new Date().toISOString() })
+          .eq("id", thought.id);
+
+        if (updateError) {
+          return {
+            content: [{ type: "text" as const, text: `Error updating thought: ${updateError.message}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{ type: "text" as const, text: `Updated thought: ${updateMsgs}` }],
+        };
+      }
+
+      const candidates = matches
+        .map((m: { content: string; similarity: number; created_at: string; metadata: Record<string, unknown> }, i: number) => {
+          const preview = m.content.slice(0, 100) + (m.content.length > 100 ? "..." : "");
+          return `${i + 1}. [${(m.similarity * 100).toFixed(0)}% match]\n   "${preview}"`;
+        })
+        .join("\n");
+
       return {
-        content: [{ type: "text" as const, text: `Updated thought: ${statusMsg}` }],
+        content: [{ type: "text" as const, text: `Found multiple possible matches. Which one?\n\n${candidates}\n\nPlease be more specific.` }],
+        isError: true,
       };
     } catch (err: unknown) {
       return {
