@@ -1,301 +1,107 @@
 # Open Brain Telegram Capture
 
-Add Telegram as a quick-capture interface and lightweight assistant for your Open Brain.
+Telegram capture and assistant layer for Open Brain, backed by Supabase Edge Functions, OpenRouter, and MCP tools.
 
-Send a message to a Telegram bot, route that message through a Supabase Edge Function, and either save it to Open Brain or answer using a model-backed assistant that can call your existing MCP tools.
+This repo now contains both sides of the integration:
 
-This project is intentionally thin. It does not rebuild embedding, tagging, or storage logic inside the Telegram integration. Instead, it reuses your existing Open Brain MCP server as the single ingestion path.
+- `telegram-capture`: receives Telegram webhooks, uses an LLM as the orchestrator, and replies back in Telegram
+- `open-brain-mcp`: exposes the Open Brain tools that actually save, search, list, and update thoughts
 
-## Architecture
+## What It Does
 
-`Telegram Bot -> Supabase Edge Function -> OpenRouter assistant -> Open Brain MCP tools -> Telegram reply`
+- Captures Telegram text messages and captions into Open Brain
+- Uses an LLM orchestrator to decide whether a message should save, search, list, update, or route to assistant chat
+- Preserves explicit user framing like `recipe`, `prompt`, `framework`, or `checklist` instead of collapsing everything into a fixed small label set
+- Supports marking tasks done and keeps completion history in metadata
+- Defaults task retrieval to active tasks, while still allowing completed-task queries
+- Stores lightweight Telegram chat memory in Supabase and compacts older history into summaries
+- Acknowledges Telegram webhooks immediately, then finishes model/tool work in the background to avoid webhook timeout failures
 
-## Why This Approach
-
-- Keeps Telegram as a capture interface, not a second copy of Open Brain logic
-- Reuses the Open Brain MCP server you already have working
-- Keeps the Edge Function small and maintainable
-- Avoids duplicating embedding and metadata logic in multiple systems
-
-## Who This Is For
-
-This guide is for someone who already has:
-
-- a working Open Brain MCP server
-- a Supabase project
-- access to Telegram
-
-If you can create a Telegram bot, deploy a Supabase Edge Function, and set environment secrets, you can implement this.
-
-## What This Version Supports
-
-- Private chat capture with your bot
-- Group or supergroup capture if you allowlist the chat ID
-- Text messages
-- Captions on media messages
-- Deduplication of Telegram webhook retries
-- Confirmation replies in Telegram
-- `/ideas`, `/recent`, `/tasks`, `/stats`, and `/search <query>` commands
-- Natural-language retrieval like `what ideas do I have saved?`
-- Conversational chat with temporary Supabase memory
-- Save suggestions for idea-like messages
-
-## What This Version Does Not Yet Support
-
-- Voice note transcription
-- Audio transcription
-- Photo OCR
-- File ingestion
-
-Those are good follow-up improvements after the assistant path is working.
-
----
-
-## Repository Contents
-
-- `README.md`
-  Full setup guide
-- `.env.example`
-  Example environment values
-- `metadata.json`
-  Project metadata
-- `supabase/functions/telegram-capture/index.ts`
-  Deployable Edge Function
-- `supabase/migrations/20260406193000_telegram_chat_memory.sql`
-  Chat memory tables and summaries
-- `supabase/sql/telegram_capture_events.sql`
-  Deduplication table SQL
-
----
-
-## Credential Tracker
-
-Copy this into a note and fill it in as you go.
+## Current Architecture
 
 ```text
-TELEGRAM CAPTURE -- CREDENTIAL TRACKER
---------------------------------------
-
-FROM YOUR OPEN BRAIN SETUP
-  Open Brain MCP base URL:     https://____________.supabase.co/functions/v1/open-brain-mcp
-  Open Brain MCP key:          ____________
-
-FROM YOUR SUPABASE SETUP
-  Supabase project ref:        ____________
-  Edge Function URL:           https://____________.supabase.co/functions/v1/telegram-capture
-
-FROM TELEGRAM
-  Bot username:                @____________
-  Bot token:                   ____________
-  Allowed chat ID:             ____________
-  Webhook secret token:        ____________
-
---------------------------------------
+Telegram Bot
+  -> Supabase Edge Function: telegram-capture
+  -> OpenRouter orchestration / assistant calls
+  -> Supabase Edge Function: open-brain-mcp
+  -> thoughts table + vector search RPCs
+  -> Telegram reply
 ```
 
----
+## Important Design Choices
+
+- The LLM is the orchestrator. Routing is not primarily regex-driven.
+- Done tasks stay in the main `thoughts` table. Retrieval filtering, not table splitting, keeps context clean.
+- Telegram webhook requests return quickly. The bot does the heavier orchestration and MCP work after the webhook has already been acknowledged.
+- `open-brain-mcp` uses its own access key layer and must be deployed with `--no-verify-jwt` so Supabase does not block the request before custom auth runs.
+
+## Repository Layout
+
+- `README.md`
+  This guide
+- `.env.example`
+  Example environment values for the Telegram function
+- `metadata.json`
+  Project metadata
+- `supabase/config.toml`
+  Supabase CLI project config used in this repo
+- `supabase/functions/telegram-capture/index.ts`
+  Telegram webhook handler and LLM orchestration layer
+- `supabase/functions/open-brain-mcp/index.ts`
+  MCP server with capture, search, list, stats, and update tools
+- `supabase/migrations/20260406175603_telegram_capture_events.sql`
+  Deduplication table migration
+- `supabase/migrations/20260406193000_telegram_chat_memory.sql`
+  Telegram memory tables migration
+- `supabase/sql/telegram_capture_events.sql`
+  SQL version of the deduplication table
 
 ## Prerequisites
 
-You need all of the following before you start:
+You need:
 
-- A working Open Brain MCP server with `capture_thought`, `search_thoughts`, `list_thoughts`, and `thought_stats`
-- A Supabase project
-- Supabase CLI installed and working
-- A Telegram account
-- Permission to create Telegram bots using `@BotFather`
-- An OpenRouter API key for the conversational assistant
+- a Supabase project
+- Supabase CLI
+- a Telegram bot token from `@BotFather`
+- an OpenRouter API key
+- an existing Open Brain database shape with:
+  - `thoughts`
+  - `match_thoughts` RPC
+  - `upsert_thought` RPC
 
-## Cost
+This repo is not a full Open Brain database bootstrap from zero. It assumes you already have the Open Brain storage and vector-search pieces available.
 
-Telegram bots are free.
+## Supported Behavior
 
-This integration reuses your existing Open Brain capture pipeline, and only the conversational assistant uses OpenRouter. Deterministic commands like `/save`, `/ideas`, and `/search` bypass the model, which keeps token usage down.
-
-The assistant also stores temporary Telegram chat memory in Supabase and compresses older raw chat rows into summaries after 20 days.
-
----
-
-## Step 1: Create the Telegram Bot
-
-1. Open Telegram.
-2. Start a chat with `@BotFather`.
-3. Send `/newbot`.
-4. Follow the prompts:
-   - choose a display name
-   - choose a username ending in `bot`
-5. Copy the bot token immediately.
-
-It will look something like this:
-
-```text
-123456789:AAExampleTokenFromBotFather
-```
-
-Save it in your credential tracker.
-
-### Recommended Bot Settings
-
-If you only want to capture messages in a private chat with the bot, the default settings are fine.
-
-If you want the bot to capture ordinary messages inside a group, you should usually disable bot privacy mode.
-
-To do that:
-
-1. In `@BotFather`, send `/mybots`
-2. Choose your bot
-3. Choose **Bot Settings**
-4. Choose **Group Privacy**
-5. Disable privacy mode
-
-If privacy mode stays enabled, Telegram may only send the bot messages that explicitly mention it or use slash commands.
-
----
-
-## Step 2: Decide Where Capture Will Happen
-
-You have three common options.
-
-### Option A: Private Chat with the Bot
-
-Best first version.
-
-- open a chat with the bot
-- send it a message like `test`
-- use that chat as your capture inbox
-
-### Option B: Group or Supergroup
-
-Useful for shared capture.
-
-- add the bot to the group
-- disable privacy mode if you want it to see normal messages
-- send a test message in the group
-
-### Option C: Channel
-
-Possible, but usually less convenient for quick personal capture. If you are building this for yourself, start with a private chat.
-
----
-
-## Step 3: Get the Allowed Chat ID
-
-The function should only accept messages from trusted chats. The simplest model is to allowlist specific chat IDs.
-
-### Easiest Method
-
-1. Send a message to the bot from the chat you want to use.
-2. In your terminal, run:
-
-```bash
-curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates"
-```
-
-3. Look for the `chat` object in the response.
-4. Copy the `chat.id`.
+- Private chat capture
+- Group, supergroup, or channel ingestion if the chat ID is allowlisted and Telegram is configured to deliver those messages
+- Text messages and captions
+- Natural-language save requests
+- Natural-language list and search requests
+- Natural-language task completion requests
+- Type corrections through `update_thought`
+- Semantic updates using fuzzy matching rather than exact text matching
+- Task status-aware retrieval
 
 Examples:
 
-- private chat: `123456789`
-- group: `-987654321`
-- supergroup: `-1001234567890`
+- `save this idea: test a new newsletter format`
+- `save this recipe: crispy roast potatoes with garlic and rosemary`
+- `mark the dashboard task as done`
+- `show my tasks`
+- `show my completed tasks`
+- `what ideas do I have about pricing?`
 
-### Important
+## Not Included Yet
 
-Do this before setting a webhook.
+- voice note transcription
+- audio transcription
+- image OCR
+- file ingestion
 
-Once a webhook is active, `getUpdates` will stop returning updates until the webhook is removed.
+## Required Secrets
 
-If you already set a webhook and need `getUpdates` again temporarily:
-
-```bash
-curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook" \
-  -H "Content-Type: application/json" \
-  -d '{"drop_pending_updates":false}'
-```
-
-Save the allowed chat ID in your credential tracker.
-
----
-
-## Step 4: Create the Deduplication Table in Supabase
-
-Telegram retries webhook deliveries when your endpoint does not acknowledge them quickly enough. To avoid duplicate captures, create a tiny table that stores processed `update_id` values.
-
-This repository includes the SQL in:
-
-`supabase/sql/telegram_capture_events.sql`
-
-Run it in the Supabase SQL editor:
-
-```sql
-create table if not exists public.telegram_capture_events (
-  update_id bigint primary key,
-  chat_id bigint not null,
-  message_id bigint,
-  processed_at timestamptz not null default now()
-);
-```
-
-That is enough for deduplication in v1.
-
-### Create the Chat Memory Tables
-
-The assistant also keeps temporary Telegram memory in Supabase.
-
-This repository includes the migration in:
-
-`supabase/migrations/20260406193000_telegram_chat_memory.sql`
-
-It creates:
-
-- `telegram_chat_state`
-- `telegram_chat_messages`
-- `telegram_chat_summaries`
-
-Run that migration too, or apply the SQL in the Supabase editor if you prefer.
-
----
-
-## Step 5: Create the Edge Function
-
-This repository includes a ready-to-use Edge Function at:
-
-`supabase/functions/telegram-capture/index.ts`
-
-If you are adding it to an existing Supabase project, create the function first:
-
-```bash
-supabase functions new telegram-capture
-```
-
-Then replace the generated file with the `index.ts` in this repository.
-
-### What the Function Does
-
-The function:
-
-1. verifies the Telegram webhook secret
-2. reads the incoming Telegram update
-3. ignores unsupported or unauthorized messages
-4. deduplicates by `update_id`
-5. detects whether the incoming message is a save request or a retrieval request
-6. calls the matching Open Brain MCP tool
-7. replies in Telegram with either a confirmation or retrieved results
-
-### Reliability Detail
-
-The function claims an `update_id` before processing to avoid duplicate concurrent handling.
-
-If the MCP call fails, the function releases that claim so Telegram can retry and the message is not lost permanently.
-
----
-
-## Step 6: Set the Edge Function Secrets
-
-You need seven secrets.
-
-### Required Secrets
+### `telegram-capture`
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET`
@@ -305,30 +111,38 @@ You need seven secrets.
 - `OPENROUTER_API_KEY`
 - `OPENROUTER_MODEL`
 
-### Secret Meanings
+### `open-brain-mcp`
+
+- `MCP_ACCESS_KEY`
+- `OPENROUTER_API_KEY`
+
+### Supabase-provided at runtime
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+## Secret Meanings
 
 - `TELEGRAM_BOT_TOKEN`
-  The bot token from `@BotFather`
+  Telegram bot token from `@BotFather`
 - `TELEGRAM_WEBHOOK_SECRET`
-  A random secret string that Telegram sends back in the `X-Telegram-Bot-Api-Secret-Token` header
+  Secret Telegram sends in `X-Telegram-Bot-Api-Secret-Token`
 - `TELEGRAM_ALLOWED_CHAT_IDS`
-  A comma-separated list of allowed chat IDs, for example `123456789,-1001234567890`
+  Comma-separated allowed chat IDs
 - `OPENBRAIN_MCP_URL`
-  The base Open Brain MCP URL without the `?key=` query parameter
+  URL of the deployed `open-brain-mcp` function, without query params
 - `OPENBRAIN_MCP_KEY`
-  Your Open Brain MCP key
+  Access key the Telegram function uses to call `open-brain-mcp`
+- `MCP_ACCESS_KEY`
+  Access key the MCP server expects via `x-brain-key` or `?key=`
 - `OPENROUTER_API_KEY`
-  Your OpenRouter API key used for conversational chat
+  Used for orchestration, assistant calls, metadata extraction, and embeddings
 - `OPENROUTER_MODEL`
-  The OpenRouter model name, for example `openai/gpt-4.1-mini`
+  Chat model for the Telegram assistant and orchestrator. Defaults to `google/gemini-3-flash-preview`
 
-### Example `.env`
+## Example Environment Values
 
-The repository includes a safe example file:
-
-`/.env.example`
-
-Its contents are:
+`.env.example` currently contains:
 
 ```env
 TELEGRAM_BOT_TOKEN=replace-with-your-bot-token
@@ -340,59 +154,119 @@ OPENROUTER_API_KEY=replace-with-your-openrouter-key
 OPENROUTER_MODEL=google/gemini-3-flash-preview
 ```
 
-### Set Secrets in Supabase
+For `open-brain-mcp`, also set:
+
+```env
+MCP_ACCESS_KEY=replace-with-your-mcp-access-key
+```
+
+## Step 1: Create the Telegram Bot
+
+1. Open Telegram.
+2. Chat with `@BotFather`.
+3. Run `/newbot`.
+4. Choose a display name and username.
+5. Save the bot token.
+
+If you want the bot to read regular group messages, disable privacy mode in BotFather.
+
+## Step 2: Get the Allowed Chat ID
+
+Before setting the webhook, send a message to the bot and inspect updates:
+
+```bash
+curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates"
+```
+
+Copy the `chat.id` you want to allow.
+
+Examples:
+
+- private chat: `123456789`
+- group: `-987654321`
+- supergroup: `-1001234567890`
+
+If a webhook is already active, temporarily clear it first:
+
+```bash
+curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{"drop_pending_updates":false}'
+```
+
+## Step 3: Create the Telegram Support Tables
+
+Apply the deduplication migration:
+
+```sql
+create table if not exists public.telegram_capture_events (
+  update_id bigint primary key,
+  chat_id bigint not null,
+  message_id bigint,
+  processed_at timestamptz not null default now()
+);
+```
+
+This exists in:
+
+- `supabase/migrations/20260406175603_telegram_capture_events.sql`
+- `supabase/sql/telegram_capture_events.sql`
+
+Apply the chat memory migration too:
+
+- `supabase/migrations/20260406193000_telegram_chat_memory.sql`
+
+It creates:
+
+- `telegram_chat_state`
+- `telegram_chat_messages`
+- `telegram_chat_summaries`
+
+## Step 4: Configure Supabase CLI
+
+If you are using this repo directly:
+
+```bash
+supabase link --project-ref <YOUR_PROJECT_REF>
+```
+
+If you fork this repo for another project, update `supabase/config.toml` to your own project ref or regenerate it with `supabase init` and `supabase link`.
+
+## Step 5: Set Secrets
+
+Example:
 
 ```bash
 supabase secrets set TELEGRAM_BOT_TOKEN="your-bot-token"
-supabase secrets set TELEGRAM_WEBHOOK_SECRET="replace-with-random-secret"
+supabase secrets set TELEGRAM_WEBHOOK_SECRET="your_webhook_secret"
 supabase secrets set TELEGRAM_ALLOWED_CHAT_IDS="123456789"
 supabase secrets set OPENBRAIN_MCP_URL="https://your-project.supabase.co/functions/v1/open-brain-mcp"
-supabase secrets set OPENBRAIN_MCP_KEY="your-openbrain-key"
+supabase secrets set OPENBRAIN_MCP_KEY="your-mcp-access-key"
+supabase secrets set MCP_ACCESS_KEY="your-mcp-access-key"
 supabase secrets set OPENROUTER_API_KEY="your-openrouter-key"
 supabase secrets set OPENROUTER_MODEL="google/gemini-3-flash-preview"
 ```
 
-### Generate a Good Webhook Secret
+Telegram webhook secret tokens should use Telegram-safe characters. Stick to letters, numbers, `_`, and `-`.
 
-Telegram webhook secret tokens should only use letters, numbers, `_`, and `-`.
-
-Example:
+Example generator:
 
 ```bash
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
 ```
 
-Telegram allows values from 1 to 256 characters.
+## Step 6: Deploy Both Functions
 
-### Notes
+Deploy `open-brain-mcp` with JWT verification disabled.
 
-- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are automatically available inside Supabase Edge Functions
-- never commit real secrets to GitHub
-- never hardcode your Open Brain key in source code
-
----
-
-## Step 7: Deploy the Function
-
-Deploy with JWT verification disabled because Telegram is the caller, not an authenticated Supabase user.
+This is important. Without `--no-verify-jwt`, Supabase will reject requests with a platform-level `401 Missing authorization header` before the function can check `MCP_ACCESS_KEY`.
 
 ```bash
+supabase functions deploy open-brain-mcp --no-verify-jwt
 supabase functions deploy telegram-capture --no-verify-jwt
 ```
 
-After deployment, save the function URL. It will look like:
-
-```text
-https://YOUR_PROJECT_REF.supabase.co/functions/v1/telegram-capture
-```
-
----
-
-## Step 8: Register the Telegram Webhook
-
-Now tell Telegram to deliver bot messages to your Edge Function.
-
-Run:
+## Step 7: Register the Telegram Webhook
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
@@ -405,80 +279,99 @@ curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
   }'
 ```
 
-You should get a success response like:
-
-```json
-{
-  "ok": true,
-  "result": true,
-  "description": "Webhook was set"
-}
-```
-
-### Check Webhook Status
+Check status:
 
 ```bash
 curl "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getWebhookInfo"
 ```
 
-If Telegram cannot reach your function, this endpoint usually tells you why.
+## How Message Handling Works
 
----
+### Telegram webhook flow
 
-## Step 9: Test It
+1. Telegram sends an update to `telegram-capture`.
+2. The function verifies `X-Telegram-Bot-Api-Secret-Token`.
+3. It rejects unauthorized chat IDs.
+4. It claims `update_id` in `telegram_capture_events` to prevent duplicate processing.
+5. It immediately returns `200 OK` to Telegram.
+6. Background processing continues with orchestration, MCP tool calls, and Telegram reply.
 
-### Simple Test
+This background-processing behavior is what keeps the LLM-enabled version reliable under webhook timing constraints.
 
-Send this to your bot:
+### Orchestration flow
 
-```text
-Need to add a Telegram capture integration to Open Brain and keep the implementation thin by reusing MCP capture_thought.
-```
+The `telegram-capture` function asks the LLM to return a structured plan with one of these actions:
 
-Expected behavior:
+- `help`
+- `save`
+- `update`
+- `query`
+- `search`
+- `assistant`
 
-1. Telegram delivers the message to the webhook
-2. The Edge Function verifies the secret and allowlisted chat
-3. The function records the `update_id` in `telegram_capture_events`
-4. The function calls your Open Brain MCP server
-5. The bot replies to the same Telegram message with something like:
+That plan can include:
 
-```text
-Captured to Open Brain
-Captured as idea - telegram, open brain
-```
+- cleaned save content
+- `type_override`
+- multiple save items
+- update intent such as `mark_done`
+- query or search filters such as `status=done`
 
-### Confirm It Worked
+### Storage behavior
 
-Use your Open Brain MCP tools to verify that the thought exists, or ask the bot directly.
-
-For example:
-
-- search for `telegram capture integration`
-- list recent thoughts
-- ask `what ideas do I have saved?`
-
----
-
-## How the Thought Is Stored
-
-The function sends the raw message text plus some capture context to Open Brain.
-
-Example:
+Saved thoughts are stored with Telegram source context appended, for example:
 
 ```text
-Need to add a Telegram capture integration to Open Brain and keep the implementation thin by reusing MCP capture_thought.
+Need to review onboarding flow copy tomorrow.
 
-[Source: Telegram | Chat: private:123456789 | From: @yourusername | Message ID: 42 | Sent At: 2026-04-06T18:22:00.000Z]
+[Source: Telegram | Chat: private:@yourusername | From: @yourusername | Message ID: 42 | Sent At: 2026-04-10T12:00:00.000Z]
 ```
 
-That makes the stored thought understandable later even when it is retrieved outside Telegram.
+## Current MCP Tool Behavior
 
----
+### `capture_thought`
 
-## Local Testing Without Telegram
+- generates embeddings
+- extracts metadata with an LLM
+- preserves explicit user type labels via `type_override`
+- defaults tasks to `status: pending`
 
-You can test the webhook handler by posting a fake Telegram update directly to the deployed function.
+### `search_thoughts`
+
+- semantic search
+- optional filters for `type`, `status`, and `include_done`
+- task searches exclude done tasks by default unless explicitly requested
+
+### `list_thoughts`
+
+- optional filters for `type`, `status`, `include_done`, `topic`, `person`, and `days`
+- task lists default to active tasks only
+- done tasks can still be listed explicitly
+
+### `update_thought`
+
+- uses semantic matching to find the target thought
+- can change type
+- can mark tasks `done`
+- adds `completed_at` when status becomes `done`
+- removes `completed_at` if status changes away from `done`
+
+## Task Handling Model
+
+Done tasks are not moved to a separate table.
+
+Instead:
+
+- tasks stay in `thoughts`
+- `metadata.status` tracks `pending`, `in_progress`, or `done`
+- `metadata.completed_at` is recorded when a task is completed
+- task retrieval defaults to active tasks so completed work does not pollute normal task views
+
+This keeps history intact without increasing LLM context unless done items are explicitly retrieved.
+
+## Local and Direct HTTP Testing
+
+You can test the Telegram webhook without waiting for Telegram:
 
 ```bash
 curl -X POST "https://YOUR_PROJECT_REF.supabase.co/functions/v1/telegram-capture" \
@@ -501,22 +394,69 @@ curl -X POST "https://YOUR_PROJECT_REF.supabase.co/functions/v1/telegram-capture
         "username": "yourusername",
         "first_name": "Your"
       },
-      "text": "what ideas do I currently have saved?"
+      "text": "show my completed tasks"
     }
   }'
 ```
 
-If this works, the core integration logic is correct and any remaining problem is likely Telegram webhook setup.
+You can probe the MCP server directly too:
 
----
+```bash
+curl -X POST "https://YOUR_PROJECT_REF.supabase.co/functions/v1/open-brain-mcp?key=YOUR_MCP_ACCESS_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "list_thoughts",
+      "arguments": { "type": "task" }
+    }
+  }'
+```
 
 ## Troubleshooting
 
+### Telegram webhook shows `500 Internal Server Error`
+
+Check:
+
+- the deployed webhook URL is correct
+- the webhook secret matches exactly
+- the latest `telegram-capture` code is deployed
+- `getWebhookInfo` for pending updates and last error details
+
+### MCP calls fail with `401 Missing authorization header`
+
+Your `open-brain-mcp` function was probably deployed without `--no-verify-jwt`.
+
+Redeploy:
+
+```bash
+supabase functions deploy open-brain-mcp --no-verify-jwt
+```
+
+### Telegram replies with `Invalid or missing access key`
+
+Check that:
+
+- `OPENBRAIN_MCP_KEY` in `telegram-capture` matches `MCP_ACCESS_KEY` in `open-brain-mcp`
+- the MCP URL is correct
+
+### Messages arrive but the bot ignores them
+
+Check:
+
+- the chat ID is in `TELEGRAM_ALLOWED_CHAT_IDS`
+- the incoming update includes `text` or `caption`
+- for groups, the bot has access to the message and privacy mode is configured correctly
+
 ### `getUpdates` returns nothing
 
-You probably already set a webhook. Telegram only allows one delivery method at a time.
+A webhook is probably active. Telegram only uses one delivery mode at a time.
 
-Temporarily clear the webhook:
+Temporarily clear it:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook" \
@@ -524,72 +464,33 @@ curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/deleteWebhook" \
   -d '{"drop_pending_updates":false}'
 ```
 
-### Telegram shows webhook errors
+### Type labels feel too generic
 
-Check:
+The current system prefers the core Open Brain labels by default, but it preserves more specific labels when the user clearly frames the item that way. If you want even stronger preservation for a category your workflow uses often, adjust the orchestration and metadata prompts together in:
 
-- the deployed Edge Function URL is correct
-- the function is deployed with `--no-verify-jwt`
-- the webhook secret matches exactly
-- `getWebhookInfo` shows no recent Telegram delivery error
+- `supabase/functions/telegram-capture/index.ts`
+- `supabase/functions/open-brain-mcp/index.ts`
 
-### Messages arrive but nothing is saved or returned
+## What I Would Update Next
 
-Check:
+If you want to keep improving this repo, the highest-value next steps are:
 
-- the chat ID is present in `TELEGRAM_ALLOWED_CHAT_IDS`
-- the message contains `text` or `caption`
-- the Open Brain MCP URL and key are correct
-- the Open Brain MCP server is reachable from the Edge Function
+1. Add real end-to-end tests for webhook payloads and MCP tool calls.
+2. Add voice and image ingestion.
+3. Add richer task lifecycle operations such as reopening or bulk task workflows.
+4. Add more explicit setup docs for the base Open Brain `thoughts` schema and RPCs.
+5. Add a small architecture diagram image for the GitHub landing page.
 
-### Duplicate captures happen
+## Summary
 
-Check:
+This repo is no longer just a thin Telegram wrapper. It is a working two-function Open Brain integration with:
 
-- the `telegram_capture_events` table exists
-- `update_id` is the primary key
-- the latest function code is deployed
+- Telegram ingestion
+- LLM orchestration
+- semantic capture and retrieval
+- flexible type labeling
+- task completion tracking
+- done-task filtering that protects normal task views
+- webhook reliability fixes for production use
 
-### Group messages do not show up
-
-Check:
-
-- the bot is actually in the group
-- the group chat ID is allowlisted
-- bot privacy mode is disabled if you want normal group messages
-
-### The bot replies with an MCP failure
-
-Check the Edge Function logs:
-
-- Supabase Dashboard -> Edge Functions -> `telegram-capture` -> Logs
-
-Most likely causes:
-
-- wrong Open Brain MCP URL
-- wrong Open Brain MCP key
-- malformed MCP response
-- temporary network failure
-
----
-
-## Recommended Follow-Up Improvements
-
-Once v1 is working, the best next upgrades are:
-
-1. Add voice note transcription before capture
-2. Add photo OCR before capture
-3. Add richer natural-language routing beyond the current heuristic assistant
-4. Add a true LLM response layer if you want open-ended chat instead of tool routing
-5. Add better result formatting for long search and list responses
-6. Add conversation memory or multi-step assistant workflows
-
----
-
-## What You Built
-
-You now have a Telegram inbox and lightweight assistant for your Open Brain.
-
-That means you can capture ideas from your phone with very low friction and also query your saved thoughts without leaving Telegram.
-
-This is still a clean architecture because Telegram only handles transport and routing, while Open Brain remains responsible for memory storage and retrieval.
+If you deploy both functions correctly and already have the base Open Brain database primitives, this repo gives you a practical Telegram inbox for your memory system.
